@@ -9,7 +9,7 @@ pip install -U "jax[cuda12]"
 
 # Run experiments
 ```
-python train_parallel.py \
+python train.py \
     --dataset_name visual-scene-play-v0 \
     --save_dir {SAVE DIR}
 ```
