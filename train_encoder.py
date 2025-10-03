@@ -1,78 +1,196 @@
+import argparse
+import os
+import sys
+import time
+import yaml
+import matplotlib.pyplot as plt
+import wandb
+
 import jax
-from jax import numpy as jnp
-from flax import nnx
+import jax.numpy as jnp
 import optax
 import flax
+from flax import nnx
+import orbax.checkpoint as ocp
+import numpy as np
 import ogbench
-from model.encoder import Encoder
-from utils.ogbench import Dataset
 
-dataset_name = "visual-scene-play-singletask-v0"
-batch_size = 32
-seed = 0
-log_every = 2
+from model.encoder import Encoder
+
+from utils.config import str2bool
+from utils.ogbench import Dataset
+import time
 
 @flax.struct.dataclass
 class TrainingState:
     model: nnx.Module
     optimizer: nnx.Optimizer
 
-@nnx.jit
-def train_step(training_state, x_1, key):
-    def loss_fn(model: nnx.Module):
+def make_flow_functions(cfg):
+    @nnx.jit
+    def train_step(training_state, x_1, key):
+        def loss_fn(model: nnx.Module):
+            z, dist = model.encode(x_1, key)
+            y_1 = model.decode(z)
+            mu = dist.mean
+            logvar = dist.logvar
+
+            loss_mse = jnp.mean((x_1 - y_1) ** 2)
+            loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
+            
+            return loss_mse + cfg.kl_weight * loss_kl
+            
+        loss, grads = nnx.value_and_grad(loss_fn)(training_state.model)
+        training_state.optimizer.update(training_state.model, grads)
+        return loss
+
+    @nnx.jit
+    def val_step(model, x_1, key):
         z, dist = model.encode(x_1, key)
         y_1 = model.decode(z)
         mu = dist.mean
         logvar = dist.logvar
-
+        
         loss_mse = jnp.mean((x_1 - y_1) ** 2)
         loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
-        
-        return loss_mse + 1e-6 * loss_kl
-        
-    loss, grads = nnx.value_and_grad(loss_fn)(training_state.model)
-    training_state.optimizer.update(training_state.model, grads)
-    return loss
 
-@nnx.jit
-def val_step(model, x_1, key):
-    z = model(x_1, key)
-    y_1 = model.decode(z)
-    return jnp.mean((x_1 - y_1) ** 2)
-    
-encoder = Encoder()
-optimizer = nnx.Optimizer(
-    encoder,
-    optax.adamw(
-        learning_rate=1e-4
-    ),
-    wrt=nnx.Param,
-)
-training_state = TrainingState(encoder, optimizer)
-train_step_cached = nnx.cached_partial(train_step, training_state)
-val_step_cached = nnx.cached_partial(val_step, training_state.model)
 
-_, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name)
-train_ds = Dataset.create(**train_dataset)
-val_ds = Dataset.create(**val_dataset)
+        return loss_mse, loss_kl, y_1
 
-key = jax.random.key(seed)
+    return train_step, val_step
 
-loss_sum = 0
-for step in range(log_every*100):
-    batch = train_ds.sample(batch_size)
-    x_1 = batch["observations"].astype(jnp.float32) / 255.0
+def run(cfg):
+    # seed setting
+    np.random.seed(cfg.seed)
+    # make save dir
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    save_dir = os.path.join(cfg.save_dir, cfg.run_name)
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
+        yaml.dump(cfg, outfile)
 
-    key, key_update = jax.random.split(key)
-    loss = train_step_cached(x_1, key)
+    wandb.init(
+        project="tdflow",
+        name=cfg.run_name,
+        config=cfg,
+        save_code=True,
+    )
 
-    loss_sum += loss
-    if step%log_every == (log_every-1):
-        train_loss = loss_sum/log_every
+    output_dir = os.path.join(save_dir, "outputs")
+    ckpt_dir = os.path.join(save_dir, "ckpts")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-        val_batch = val_ds.sample(batch_size)
-        val_x = val_batch["observations"].astype(jnp.float32) / 255.0
-        val_loss = val_step_cached(val_x, key)
+    # build dataset
+    _, train_dataset, val_dataset = ogbench.make_env_and_datasets(cfg.dataset_name)
+    train_ds = Dataset.create(**train_dataset)
+    val_ds = Dataset.create(**val_dataset)
 
-        print(step, train_loss, val_loss)
-        loss_sum = 0
+
+    # build training state
+    encoder = Encoder()
+    optimizer = nnx.Optimizer(
+        encoder,
+        optax.adamw(
+            learning_rate=cfg.lr,
+            b1=cfg.beta_1,
+            b2=cfg.beta_2,
+            weight_decay=cfg.weight_decay,
+        ),
+        wrt=nnx.Param,
+    )
+    training_state = TrainingState(encoder, optimizer)
+
+    # build sample, train fns
+    train_step, val_step = make_flow_functions(cfg)
+    train_step_cached = nnx.cached_partial(train_step, training_state)
+    val_step_cached = nnx.cached_partial(val_step, training_state.model)
+
+    # training
+    loss_sum = 0.0
+    key = jax.random.key(cfg.seed)
+
+    start = time.time()
+    for step in range(1, cfg.num_updates + 1):
+        batch = train_ds.sample(cfg.batch_size)
+        x_1 = batch["observations"].astype(jnp.float32) / 255.0
+
+        key, key_update = jax.random.split(key)
+        loss_sum += train_step_cached(x_1, key_update)
+
+        if step % cfg.log_every == 0:
+            loss_avg = loss_sum / cfg.log_every
+            training_time = time.time() - start
+            print(f"step: {step} | loss: {loss_avg} | time: {training_time}")
+            wandb.log(
+                {
+                    "train/loss": loss_avg,
+                },
+                step=step,
+            )
+            loss_sum = 0
+
+        if step % cfg.eval_every == 0 or step == 1:
+            batch = val_ds.sample(cfg.eval_batch_size)
+            x_val = batch["observations"].astype(jnp.float32) / 255.0
+            
+            key, key_sample = jax.random.split(key)
+            loss_mse, loss_kl, y_val = val_step_cached(x_val, key_sample)
+
+            x_np = np.array(x_val)
+            y_np = np.array(y_val)
+            y_np = np.clip(y_np, 0, 1)
+            
+            rows = []
+            for i in range(cfg.eval_batch_size):
+                row = np.concatenate([x_np[i], y_np[i]], axis=1)
+                rows.append(row)
+            x_render = np.concatenate(rows, axis=0)
+            plt.imshow(x_render)
+            plt.savefig(os.path.join(output_dir, f"samples_{step}"))
+            wandb.log({
+                    "eval/loss_mse": loss_mse,
+                    "eval/loss_kl": loss_kl,
+                    "eval/samples": wandb.Image(x_render),
+                }, 
+                step=step
+            )
+
+    #     if (step + 1) % config["SAVE_EVERY"] == 0:
+    #         ema_algo = nnx.merge(graphdef, ema_params)
+    #         ema_algo_state = nnx.state(ema_algo)
+    #         checkpointer.save(os.path.join(ckpt_dir, f"ema_{step + 1}"), ema_algo_state)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--debug", type=str2bool, default=False)
+    # dataset
+    """
+    always put channel dimension at the end
+    """
+    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-v0")
+    # optimizer
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--beta_1", type=float, default=0.9)
+    parser.add_argument("--beta_2", type=float, default=0.999)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    # training
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_updates", type=int, default=10000)
+    parser.add_argument("--kl_weight", type=float, default=1e-6)
+    # eval and logging
+    parser.add_argument("--eval_every", type=int, default=1000)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--save_every", type=int, default=2500)
+    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--save_dir", type=str, default="results/"
+    )
+    parser.add_argument("--run_name", type=str, default="encoder")
+
+    args, rest_args = parser.parse_known_args(sys.argv[1:])
+
+    run(args)

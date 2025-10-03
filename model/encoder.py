@@ -13,7 +13,7 @@ class Encoder(nnx.Module):
         )
         self.module = module
         self.params = jax.tree_util.tree_map(
-            lambda p: nnx.Param(p), params
+            nnx.Param, params
         )
     
     def encode(self, images, key):
