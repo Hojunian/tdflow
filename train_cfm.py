@@ -4,6 +4,7 @@ import sys
 import time
 import yaml
 import matplotlib.pyplot as plt
+import wandb
 
 import jax
 import jax.numpy as jnp
@@ -83,6 +84,13 @@ def run(cfg):
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
         yaml.dump(cfg, outfile)
 
+    wandb.init(
+        project="tdflow",
+        name=cfg.run_name,
+        config=cfg,
+        save_code=True,
+    )
+
     output_dir = os.path.join(save_dir, "outputs")
     ckpt_dir = os.path.join(save_dir, "ckpts")
     os.makedirs(output_dir, exist_ok=True)
@@ -152,6 +160,12 @@ def run(cfg):
             loss_avg = loss_sum / cfg.log_every
             training_time = time.time() - start
             print(f"step: {step} | loss: {loss_avg} | time: {training_time}")
+            wandb.log(
+                {
+                    "train/loss": loss_avg,
+                },
+                step=step,
+            )
             loss_sum = 0
 
         if step % cfg.eval_every == 0 or step == 1:
@@ -170,6 +184,8 @@ def run(cfg):
             x_render = np.concatenate(rows, axis=0)
             plt.imshow(x_render)
             plt.savefig(os.path.join(output_dir, f"samples_{step}"))
+            wandb.log({"eval/samples": wandb.Image(x_render)}, step=step)
+
 
     #     if (step + 1) % config["SAVE_EVERY"] == 0:
     #         ema_algo = nnx.merge(graphdef, ema_params)
