@@ -50,8 +50,7 @@ class TimestepEmbedder(nnx.Module):
         :return: an (N, D) Tensor of positional embeddings.
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        t = jax.lax.convert_element_type(t, jnp.float32)
-        # t = t * max_period
+        t = t * max_period
         dim = self.frequency_embedding_size
         half = dim // 2
         freqs = jnp.exp(

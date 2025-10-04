@@ -79,7 +79,7 @@ class DiTBlock(nnx.Module):
         )
         self.adaLN_modulation = [
             nnx.silu,
-            nnx.Linear(hidden_size, hidden_size * 6, dtype=dtype, rngs=rngs),
+            nnx.Linear(hidden_size, hidden_size * 6, kernel_init=nnx.initializers.zeros_init(), dtype=dtype, rngs=rngs),
         ]
 
         self.qkv = nnx.Linear(
@@ -151,11 +151,11 @@ class FinalLayer(nnx.Module):
             hidden_size, use_bias=False, use_scale=False, dtype=dtype, rngs=rngs
         )
         self.linear = nnx.Linear(
-            hidden_size, patch_size * patch_size * out_channels, dtype=dtype, rngs=rngs
+            hidden_size, patch_size * patch_size * out_channels, kernel_init=nnx.initializers.zeros_init(), dtype=dtype, rngs=rngs
         )
         self.adaLN_modulation = [
             nnx.silu,
-            nnx.Linear(hidden_size, hidden_size * 2, dtype=dtype, rngs=rngs),
+            nnx.Linear(hidden_size, hidden_size * 2, kernel_init=nnx.initializers.zeros_init(), dtype=dtype, rngs=rngs),
         ]
 
     def __call__(self, x, c):
@@ -198,14 +198,78 @@ class DiT2D(nnx.Module):
 
         self.x_embedder = PatchEmbed(patch_size, in_channels, hidden_size, dtype, rngs)
         self.t_embedder = TimestepEmbedder(hidden_size, dtype, rngs)
-        self.a_embedder = nnx.Linear(action_dim, hidden_size, rngs=rngs)
 
         self.blocks = [
             DiTBlock(hidden_size, num_heads, dtype, rngs) for _ in range(depth)
         ]
         self.final_layer = FinalLayer(patch_size, in_channels, hidden_size, dtype, rngs)
 
-        # todo: initialization (lets skip now)
+    def __call__(self, x, t):
+        x = self.x_embedder(x)
+        x += get_2d_sincos_pos_embed(
+            None, self.hidden_size, self.img_size, self.patch_size
+        ).astype(self.dtype)
+        c = self.t_embedder(t)
+
+        for block in self.blocks:
+            x = block(x, c)
+
+        x = self.final_layer(x, c)
+
+        x = jnp.reshape(
+            x,
+            (
+                x.shape[0],
+                self.num_patches_h,
+                self.num_patches_w,
+                self.patch_size,
+                self.patch_size,
+                self.in_channels,
+            ),
+        )
+        x = jnp.einsum("bhwpqc->bhpwqc", x)
+        x = rearrange(
+            x,
+            "B H P W Q C -> B (H P) (W Q) C",
+            H=self.num_patches_h,
+            W=self.num_patches_w,
+        )
+
+        return x
+    
+class DiT2D_GHM(nnx.Module):
+    """
+    Diffusion model with a Transformer backbone.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        hidden_size: int,
+        depth: int,
+        num_heads: int,
+        img_size: tuple,
+        in_channels: int,
+        action_dim: int,
+        rngs: nnx.Rngs,
+        dtype: Dtype = jnp.bfloat16,
+    ):
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.in_channels = in_channels
+        self.img_size = img_size
+        self.num_patches_h = img_size[0] // patch_size
+        self.num_patches_w = img_size[1] // patch_size
+        self.dtype = dtype
+
+        self.x_embedder = PatchEmbed(patch_size, in_channels, hidden_size, dtype, rngs)
+        self.t_embedder = TimestepEmbedder(hidden_size, dtype, rngs)
+        self.a_embedder = nnx.Linear(action_dim, hidden_size, rngs=rngs)
+
+        self.blocks = [
+            DiTBlock(hidden_size, num_heads, dtype, rngs) for _ in range(depth)
+        ]
+        self.final_layer = FinalLayer(patch_size, in_channels, hidden_size, dtype, rngs)
 
     def __call__(self, x, t, a=None):
         x = self.x_embedder(x)

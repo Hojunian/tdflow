@@ -26,36 +26,60 @@ class TrainingState:
     optimizer: nnx.Optimizer
 
 def make_flow_functions(cfg, data_shape):
+    eval_dt = 1 / cfg.eval_denoise_steps
     @nnx.jit
-    def sample(model: nnx.Module, key: jnp.ndarray):
-        @nnx.scan(length=cfg.denoise_timesteps//cfg.eval_dt, in_axes=(nnx.Carry), out_axes=(nnx.Carry))
+    def sample(model: nnx.Module, x: jnp.ndarray, a:jnp.ndarray, key: jnp.ndarray):
+        @nnx.scan(length=cfg.eval_denoise_steps, in_axes=(nnx.Carry), out_axes=(nnx.Carry))
         def sample_step(carry):
             x_t, t = carry
-            dx = model(x_t, t) * (cfg.eval_dt / cfg.denoise_timesteps)
-            x_t += dx
-            t += cfg.eval_dt
+
+            x_t_mid = x_t + model(x_t, t) * (eval_dt / 2)
+            t_mid = t + (eval_dt / 2)
+
+            x_t += model(x_t_mid, t_mid) * eval_dt
+            t += eval_dt
             return (x_t, t)
         
         x_t = jax.random.normal(key, shape=(cfg.eval_batch_size,) + data_shape)
-        t = jnp.zeros((cfg.eval_batch_size,), dtype=int)
+        t = jnp.zeros((cfg.eval_batch_size,), dtype=jnp.float32)
 
         return sample_step((x_t,t))[0]
 
     @nnx.jit
-    def train_step(training_state: TrainingState, x: jnp.ndarray, key: jnp.ndarray):
-        key, key_time = jax.random.split(key)
-        t = jax.random.randint(
-            key_time,
-            shape=((x.shape[0]),),
-            minval=0,
-            maxval=cfg.denoise_timesteps,
-        )
-        t_full = t / cfg.denoise_timesteps
+    def train_step(training_state: TrainingState, batch: dict, key: jnp.ndarray):
         
+
+        key, key_time = jax.random.split(key)
+        t_cfm = jax.random.uniform(key_time, shape=((x.shape[0]),))
         key, key_noise = jax.random.split(key)
         x_0 = jax.random.normal(key_noise, x.shape)
-        x_t = x_0 + t_full[:, None, None, None] * (x - (1 - 1e-5) * x_0)
-        v_t = x - (1 - 1e-5) * x_0
+        x_t_cfm = x_0 + t_cfm[:, None, None, None] * (x - (1 - 1e-5) * x_0)
+        v_t_cfm = x - (1 - 1e-5) * x_0
+
+        @nnx.scan(length=cfg.target_denoise_steps, in_axes=(nnx.Carry, None), out_axes=(nnx.Carry))
+        def sample_step(carry, dt):
+            x_t, t = carry
+
+            x_t_mid = x_t + training_state.model(x_t, t) * (dt / 2)
+            t_mid = t + (dt / 2)
+
+            x_t += training_state.model(x_t_mid, t_mid) * dt
+            t += dt
+            return (x_t, t)
+
+        key, key_time = jax.random.split(key)
+        t_bootstrap = jax.random.uniform(key_time, shape=((x.shape[0]),))
+        dt_bootstrap = t_bootstrap / cfg.target_denoise_steps
+        key, key_noise = jax.random.split(key)
+        x_0 = jax.random.normal(key_noise, x.shape)
+        x_t_bootstrap, t_bootstrap = sample_step((x_0, jnp.zeros((x.shape[0], 0))), dt_bootstrap)
+        v_t_bootstrap = training_state.model(x_t_bootstrap, t_bootstrap)
+
+
+
+        key, key_noise = jax.random.split(key)
+        x_0 = jax.random.normal(key_noise, x.shape)
+
 
         def loss_fn(model: nnx.Module):
             v_t_pred = model(x_t, t)
@@ -181,23 +205,13 @@ def run(cfg):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--debug", type=str2bool, default=False)
     # dataset
-    """
-    always put channel dimension at the end
-    """
     parser.add_argument("--dataset_name", type=str, default="visual-scene-play-v0")
-    parser.add_argument("--data_type", type=str, default="image")
     # network architecture
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--patch_size", type=int, default=2)
     parser.add_argument("--num_heads", type=int, default=8)
-    # flow matching
-    parser.add_argument("--algo", type=str, default="flow_matching")
-    parser.add_argument("--denoise_timesteps", type=int, default=128)
-    parser.add_argument("--denoise_path", type=str, default="cond_ot")
     # optimizer
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta_1", type=float, default=0.9)
@@ -207,15 +221,17 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--ema_decay", type=float, default=0.99)
+    parser.add_argument("--target_denoise_steps", type=int, default=10)
+    parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--num_updates", type=int, default=100000)
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=10000)
     parser.add_argument("--eval_batch_size", type=int, default=16)
-    parser.add_argument("--eval_dt", type=int, default=1)
+    parser.add_argument("--eval_denoise_steps", type=int, default=50)
     parser.add_argument("--save_every", type=int, default=25000)
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument(
-        "--save_dir", type=str, default="/home/hojun/tdflow/results/"
+        "--save_dir", type=str, default="results/"
     )
     parser.add_argument("--run_name", type=str, default="demo")
 
