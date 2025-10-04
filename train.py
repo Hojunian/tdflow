@@ -13,11 +13,12 @@ import flax
 from flax import nnx
 import orbax.checkpoint as ocp
 import numpy as np
+import ogbench
 
-from model.network import DiT2D
+from model.encoder import Encoder, EncodedDiT2D
 
 from utils.config import str2bool
-from utils.ogbench import make_datasets
+from utils.ogbench import Dataset
 import time
 
 @flax.struct.dataclass
@@ -81,7 +82,11 @@ def run(cfg):
     np.random.seed(cfg.seed)
     # make save dir
     os.makedirs(cfg.save_dir, exist_ok=True)
-    save_dir = os.path.join(cfg.save_dir, cfg.run_name)
+    short_dataset_name = cfg.dataset_name.replace("visual-","").replace("-singletask","").replace("-v0","")
+    save_dir = os.path.join(cfg.save_dir, short_dataset_name, cfg.run_name)
+    save_dir = os.path.abspath(os.path.expanduser(save_dir))
+    encoder_save_dir = save_dir = os.path.join(cfg.save_dir, short_dataset_name, "encoder")
+    encoder_save_dir = os.path.abspath(os.path.expanduser(encoder_save_dir))
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
         yaml.dump(cfg, outfile)
@@ -95,15 +100,33 @@ def run(cfg):
 
     output_dir = os.path.join(save_dir, "outputs")
     ckpt_dir = os.path.join(save_dir, "ckpts")
+    encoder_ckpt_dir = os.path.join(encoder_save_dir, "ckpts")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # build dataset
-    train_ds, __ = make_datasets(cfg.dataset_name)
+    _, train_dataset, val_dataset = ogbench.make_env_and_datasets(cfg.dataset_name)
+    for k in ['qpos', 'qvel', 'button_states']:
+        if k in train_dataset:
+            del train_dataset[k]
+        if k in val_dataset:
+            del val_dataset[k]
+    train_ds = Dataset.create(**train_dataset)
+    val_ds = Dataset.create(**val_dataset)
     obs_shape = train_ds["observations"][0].shape
 
+    checkpointer = ocp.StandardCheckpointer()
+
     # build training state
-    model = DiT2D(
+    abstract_encoder = nnx.eval_shape(
+        lambda: Encoder(
+            rngs=nnx.Rngs(cfg.seed),
+            from_pretrained=False,
+        )
+    )
+    graphdef, abstract_state = nnx.split(abstract_encoder)
+    state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{15000}"), abstract_state)
+    model = EncodedDiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
@@ -113,7 +136,7 @@ def run(cfg):
         action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
-    ema_model = DiT2D(
+    ema_model = EncodedDiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
@@ -123,6 +146,7 @@ def run(cfg):
         action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
+    nnx.update(model.encoder, state)
     nnx.update(ema_model, nnx.state(model))
     optimizer = nnx.Optimizer(
         model,
@@ -140,8 +164,6 @@ def run(cfg):
     sample_fn, train_step = make_flow_functions(cfg, obs_shape)
     sample_fn_chached = nnx.cached_partial(sample_fn, training_state.model)
     train_step_cached = nnx.cached_partial(train_step, training_state)
-
-    checkpointer = ocp.StandardCheckpointer()
 
     # setup train, sample function
     metric = nnx.metrics.Average()
@@ -189,10 +211,12 @@ def run(cfg):
             wandb.log({"eval/samples": wandb.Image(x_render)}, step=step)
 
 
-    #     if (step + 1) % config["SAVE_EVERY"] == 0:
-    #         ema_algo = nnx.merge(graphdef, ema_params)
-    #         ema_algo_state = nnx.state(ema_algo)
-    #         checkpointer.save(os.path.join(ckpt_dir, f"ema_{step + 1}"), ema_algo_state)
+        if (step + 1) % cfg.save_every == 0:
+            _, state = nnx.split(ema_model)
+            checkpointer.save(os.path.join(ckpt_dir, f"ema_{step + 1}"), state)
+
+    checkpointer.wait_until_finished()
+    checkpointer.close()
 
 
 if __name__ == "__main__":
@@ -203,13 +227,13 @@ if __name__ == "__main__":
     """
     always put channel dimension at the end
     """
-    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-v0")
+    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-singletask-v0")
     parser.add_argument("--data_type", type=str, default="image")
     # network architecture
-    parser.add_argument("--hidden_size", type=int, default=256)
+    parser.add_argument("--hidden_size", type=int, default=768)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--patch_size", type=int, default=2)
-    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--num_heads", type=int, default=12)
     # flow matching
     parser.add_argument("--algo", type=str, default="flow_matching")
     parser.add_argument("--denoise_timesteps", type=int, default=128)

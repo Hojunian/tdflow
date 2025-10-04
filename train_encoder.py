@@ -170,6 +170,8 @@ def run(cfg):
             _, state = nnx.split(encoder)
             checkpointer.save(os.path.join(ckpt_dir, f"encoder_{step + 1}"), state)
 
+    checkpointer.wait_until_finished()
+    checkpointer.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

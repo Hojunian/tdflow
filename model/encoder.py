@@ -4,6 +4,8 @@ from jax import numpy as jnp
 from einops import rearrange
 from diffusers import FlaxAutoencoderKL
 
+from model.network import DiT2D
+
 class Encoder(nnx.Module):
     def __init__(
             self,
@@ -16,6 +18,7 @@ class Encoder(nnx.Module):
         )
         self.module = nnx.bridge.ToNNX(module)
         self.scaling_factor = module.config.scaling_factor
+        self.rngs = rngs
         
         # init
         x = jnp.zeros((1, 3, 8, 8))
@@ -23,11 +26,11 @@ class Encoder(nnx.Module):
         if from_pretrained:
             nnx.update(self.module, jax.device_get(params))
     
-    def encode(self, images, key):
+    def encode(self, images):
         images = (images - 0.5) / 0.5
         images = rearrange(images, "b h w c -> b c h w")
         latent_dist = self.module.encode(images).latent_dist
-        latents = latent_dist.sample(key)
+        latents = latent_dist.sample(self.rngs())
         latents *= self.scaling_factor
         images = rearrange(images, "b c h w -> b h w c")
         return latents, latent_dist
@@ -40,6 +43,20 @@ class Encoder(nnx.Module):
         images = images * 0.5 + 0.5
         return images
     
-    def __call__(self, images, key):
-        latents, _ = self.encode(images, key)
+    def __call__(self, images):
+        latents, _ = self.encode(images)
         return latents
+
+class EncodedDiT2D(DiT2D):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        rngs = kwargs["rngs"]
+        self.encoder = Encoder(
+            rngs = rngs,
+            from_pretrained = False,
+        )
+    
+    def __call__(self, x, t, a=None):
+        x = self.encoder(x)
+        x = super().__call__(x, t, a)
+        return self.encoder.decode(x)
