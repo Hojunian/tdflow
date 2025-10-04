@@ -28,9 +28,9 @@ class TrainingState:
 
 def make_flow_functions(cfg):
     @nnx.jit
-    def train_step(training_state, x_1, key):
+    def train_step(training_state, x_1):
         def loss_fn(model: nnx.Module):
-            z, dist = model.encode(x_1, key)
+            z, dist = model.encode(x_1)
             y_1 = model.decode(z)
             mu = dist.mean
             logvar = dist.logvar
@@ -45,8 +45,8 @@ def make_flow_functions(cfg):
         return loss
 
     @nnx.jit
-    def val_step(model, x_1, key):
-        z, dist = model.encode(x_1, key)
+    def val_step(model, x_1):
+        z, dist = model.encode(x_1)
         y_1 = model.decode(z)
         mu = dist.mean
         logvar = dist.logvar
@@ -125,8 +125,7 @@ def run(cfg):
         batch = train_ds.sample(cfg.batch_size)
         x_1 = batch["observations"].astype(jnp.float32) / 255.0
 
-        key, key_update = jax.random.split(key)
-        loss_sum += train_step_cached(x_1, key_update)
+        loss_sum += train_step_cached(x_1)
 
         if step % cfg.log_every == 0:
             loss_avg = loss_sum / cfg.log_every
@@ -144,8 +143,7 @@ def run(cfg):
             batch = val_ds.sample(cfg.eval_batch_size)
             x_val = batch["observations"].astype(jnp.float32) / 255.0
             
-            key, key_sample = jax.random.split(key)
-            loss_mse, loss_kl, y_val = val_step_cached(x_val, key_sample)
+            loss_mse, loss_kl, y_val = val_step_cached(x_val)
 
             x_np = np.array(x_val)
             y_np = np.array(y_val)
