@@ -64,7 +64,9 @@ def run(cfg):
     np.random.seed(cfg.seed)
     # make save dir
     os.makedirs(cfg.save_dir, exist_ok=True)
-    save_dir = os.path.join(cfg.save_dir, cfg.run_name)
+    short_dataset_name = cfg.dataset_name.replace("visual-","").replace("-singletask","").replace("-v0","")
+    save_dir = os.path.join(cfg.save_dir, short_dataset_name, cfg.run_name)
+    save_dir = os.path.abspath(os.path.expanduser(save_dir))
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
         yaml.dump(cfg, outfile)
@@ -83,12 +85,20 @@ def run(cfg):
 
     # build dataset
     _, train_dataset, val_dataset = ogbench.make_env_and_datasets(cfg.dataset_name)
+    for k in ['qpos', 'qvel', 'button_states']:
+        if k in train_dataset:
+            del train_dataset[k]
+        if k in val_dataset:
+            del val_dataset[k]
     train_ds = Dataset.create(**train_dataset)
     val_ds = Dataset.create(**val_dataset)
 
+    checkpointer = ocp.StandardCheckpointer()
 
     # build training state
-    encoder = Encoder()
+    encoder = Encoder(
+        rngs=nnx.Rngs(cfg.seed),
+    )
     optimizer = nnx.Optimizer(
         encoder,
         optax.adamw(
@@ -156,10 +166,9 @@ def run(cfg):
                 step=step
             )
 
-    #     if (step + 1) % config["SAVE_EVERY"] == 0:
-    #         ema_algo = nnx.merge(graphdef, ema_params)
-    #         ema_algo_state = nnx.state(ema_algo)
-    #         checkpointer.save(os.path.join(ckpt_dir, f"ema_{step + 1}"), ema_algo_state)
+        if (step + 1) % cfg.save_every == 0:
+            _, state = nnx.split(encoder)
+            checkpointer.save(os.path.join(ckpt_dir, f"encoder_{step + 1}"), state)
 
 
 if __name__ == "__main__":
@@ -170,7 +179,7 @@ if __name__ == "__main__":
     """
     always put channel dimension at the end
     """
-    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-v0")
+    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-singletask-v0")
     # optimizer
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta_1", type=float, default=0.9)
@@ -178,14 +187,14 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.1)
     # training
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_updates", type=int, default=10000)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_updates", type=int, default=20000)
     parser.add_argument("--kl_weight", type=float, default=1e-6)
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=1000)
     parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--save_every", type=int, default=2500)
-    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--save_every", type=int, default=5000)
+    parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument(
         "--save_dir", type=str, default="results/"
     )
