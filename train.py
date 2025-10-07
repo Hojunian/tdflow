@@ -45,6 +45,9 @@ def make_flow_functions(cfg, data_shape):
 
     @nnx.jit
     def train_step(training_state: TrainingState, x: jnp.ndarray, key: jnp.ndarray):
+        key, key_encoder = jax.random.split(key)
+        x = training_state.ema_model.encoder(x, key=key_encoder)
+        
         key, key_time = jax.random.split(key)
         t = jax.random.randint(
             key_time,
