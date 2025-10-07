@@ -14,7 +14,7 @@ from flax import nnx
 import orbax.checkpoint as ocp
 import numpy as np
 
-from model.network import DiT2D
+from model.encoder import Encoder, EncodedDiT2D
 
 from utils.config import str2bool
 from utils.ogbench import make_datasets
@@ -44,10 +44,14 @@ def make_flow_functions(cfg, data_shape):
         x_t = jax.random.normal(key, shape=(cfg.eval_batch_size,) + data_shape)
         t = jnp.zeros((cfg.eval_batch_size,), dtype=jnp.float32)
 
-        return sample_step((x_t,t))[0]
+        x_1 = sample_step((x_t,t))[0]
+        return model.encoder.decode(x_1)
 
     @nnx.jit
     def train_step(training_state: TrainingState, x: jnp.ndarray, key: jnp.ndarray):
+        key, key_encoder = jax.random.split(key)
+        x = training_state.model.encoder(x, key_encoder)
+        
         key, key_time = jax.random.split(key)
         t = jax.random.uniform(key_time, shape=((x.shape[0]),))
         
@@ -79,7 +83,11 @@ def run(cfg):
     np.random.seed(cfg.seed)
     # make save dir
     os.makedirs(cfg.save_dir, exist_ok=True)
-    save_dir = os.path.join(cfg.save_dir, cfg.run_name)
+    short_dataset_name = cfg.dataset_name.replace("visual-","").replace("-singletask","").replace("-v0","")
+    save_dir = os.path.join(cfg.save_dir, short_dataset_name, cfg.run_name)
+    save_dir = os.path.abspath(os.path.expanduser(save_dir))
+    encoder_save_dir = save_dir = os.path.join(cfg.save_dir, short_dataset_name, "encoder")
+    encoder_save_dir = os.path.abspath(os.path.expanduser(encoder_save_dir))
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
         yaml.dump(cfg, outfile)
@@ -93,15 +101,27 @@ def run(cfg):
 
     output_dir = os.path.join(save_dir, "outputs")
     ckpt_dir = os.path.join(save_dir, "ckpts")
+    encoder_ckpt_dir = os.path.join(encoder_save_dir, "ckpts")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # build dataset
     train_ds, __ = make_datasets(cfg.dataset_name)
     obs_shape = train_ds["observations"][0].shape
+    ## latent
+    obs_shape = tuple(x//8 for x in obs_shape[:-1]) + (4,)
 
     # build training state
-    model = DiT2D(
+    checkpointer = ocp.StandardCheckpointer()
+    abstract_encoder = nnx.eval_shape(
+        lambda: Encoder(
+            rngs=nnx.Rngs(cfg.seed),
+            from_pretrained=False,
+        )
+    )
+    _, abstract_state = nnx.split(abstract_encoder)
+    encoder_state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{cfg.encoder_ckpt}"), abstract_state)
+    model = EncodedDiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
@@ -111,7 +131,7 @@ def run(cfg):
         action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
-    ema_model = DiT2D(
+    ema_model = EncodedDiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
@@ -121,6 +141,7 @@ def run(cfg):
         action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
+    nnx.update(model.encoder, encoder_state)
     nnx.update(ema_model, nnx.state(model))
     optimizer = nnx.Optimizer(
         model,
@@ -138,8 +159,6 @@ def run(cfg):
     sample_fn, train_step = make_flow_functions(cfg, obs_shape)
     sample_fn_chached = nnx.cached_partial(sample_fn, training_state.model)
     train_step_cached = nnx.cached_partial(train_step, training_state)
-
-    checkpointer = ocp.StandardCheckpointer()
 
     # setup train, sample function
     metric = nnx.metrics.Average()
@@ -192,11 +211,13 @@ def run(cfg):
     #         ema_algo_state = nnx.state(ema_algo)
     #         checkpointer.save(os.path.join(ckpt_dir, f"ema_{step + 1}"), ema_algo_state)
 
+    checkpointer.wait_until_finished()
+    checkpointer.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # dataset
-    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-v0")
+    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-singletask-v0")
     # network architecture
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
@@ -212,6 +233,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--ema_decay", type=float, default=0.99)
     parser.add_argument("--num_updates", type=int, default=100000)
+    parser.add_argument("--encoder_ckpt", type=str, default="25000")
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=10000)
     parser.add_argument("--eval_batch_size", type=int, default=16)
