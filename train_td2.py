@@ -26,12 +26,15 @@ class TrainingState:
     model: nnx.Module
     ema_model: nnx.Module
     encoder: nnx.Module
+    ema_encoder: nnx.Module
     optimizer: nnx.Optimizer
+    encoder_optimizer: nnx.Optimizer
 
 def make_flow_functions(cfg, data_shape):
     eval_dt = 1 / cfg.eval_denoise_steps
     @nnx.jit
     def sample(model: nnx.Module, encoder: nnx.Module, batch: dict, key: jnp.ndarray):
+        key, key_current = jax.random.split(key)
         x_current_raw = batch["observations"].astype(jnp.float32) / 255.0
         x_current = encoder(x_current_raw)
         a_current = batch["actions"]
@@ -50,24 +53,36 @@ def make_flow_functions(cfg, data_shape):
         t = jnp.zeros((cfg.eval_batch_size,), dtype=jnp.float32)
 
         x_1 = sample_step((x_t,t))[0]
-        return x_current_raw, encoder.decode(x_1)
+
+        z, dist = encoder.encode(x_current_raw, key_current)
+        y_1 = encoder.decode(z)
+        mu = dist.mean
+        logvar = dist.logvar
+
+        loss_mse = jnp.mean((x_current_raw - y_1) ** 2)
+        loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
+        info = {
+            "eval/loss_mse": loss_mse,
+            "eval/loss_kl": loss_kl,
+        }
+
+        return x_current_raw, encoder.decode(x_1), info
 
     @nnx.jit
     def train_step(training_state: TrainingState, batch: dict, key: jnp.ndarray):
         key, key_current = jax.random.split(key)
         x_current_raw = batch["observations"].astype(jnp.float32) / 255.0
-        x_current = training_state.encoder(x_current_raw, key_current)
         a_current = batch["actions"]
         key, key_next = jax.random.split(key)
         x_next_raw = batch["next_observations"].astype(jnp.float32) / 255.0
-        x_next = training_state.encoder(x_next_raw, key_next)
+        x_next = training_state.ema_encoder(x_next_raw, key_next)
         a_next = batch["next_actions"]
         mask = batch["masks"][:, None, None, None]
 
         key, key_time = jax.random.split(key)
-        t_cfm = jax.random.uniform(key_time, shape=((x_current.shape[0]),))
+        t_cfm = jax.random.uniform(key_time, shape=((x_next.shape[0]),))
         key, key_noise = jax.random.split(key)
-        x_0 = jax.random.normal(key_noise, x_current.shape)
+        x_0 = jax.random.normal(key_noise, x_next.shape)
         x_t_cfm = x_0 + t_cfm[:, None, None, None] * (x_next - (1 - 1e-5) * x_0)
         v_t_cfm = x_next - (1 - 1e-5) * x_0
 
@@ -83,23 +98,42 @@ def make_flow_functions(cfg, data_shape):
             return (x_t, t)
 
         key, key_time = jax.random.split(key)
-        t_bootstrap = jax.random.uniform(key_time, shape=((x_current.shape[0]),))
+        t_bootstrap = jax.random.uniform(key_time, shape=((x_next.shape[0]),))
         dt_bootstrap = t_bootstrap / cfg.target_denoise_steps
         key, key_noise = jax.random.split(key)
-        x_0 = jax.random.normal(key_noise, x_current.shape)
-        x_t_bootstrap, t_bootstrap = sample_step((x_0, jnp.zeros((x_current.shape[0], ))), dt_bootstrap)
+        x_0 = jax.random.normal(key_noise, x_next.shape)
+        x_t_bootstrap, t_bootstrap = sample_step((x_0, jnp.zeros((x_next.shape[0], ))), dt_bootstrap)
         v_t_bootstrap = jax.lax.stop_gradient(training_state.ema_model(x_t_bootstrap, x_next, a_next, t_bootstrap))
 
-        def loss_fn(model: nnx.Module):
+        def loss_fn(model: nnx.Module, encoder: nnx.Module):
+            x_current = encoder(x_current_raw)
             next_state_loss = jnp.mean((v_t_cfm - model(x_t_cfm, x_current, a_current, t_cfm)) ** 2) 
             bootstrap_loss = jnp.mean(
                 mask * (v_t_bootstrap - model(x_t_bootstrap, x_current, a_current, t_bootstrap)) ** 2
             )
 
-            return (1 - cfg.gamma) * next_state_loss + cfg.gamma * bootstrap_loss
+            z, dist = encoder.encode(x_current_raw, key_current)
+            y_1 = encoder.decode(z)
+            mu = dist.mean
+            logvar = dist.logvar
+
+            loss_fm = (1 - cfg.gamma) * next_state_loss + cfg.gamma * bootstrap_loss
+            loss_mse = jnp.mean((x_current_raw - y_1) ** 2)
+            loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
+
+            loss = loss_fm + cfg.encoder_weight * (loss_mse + cfg.kl_weight * loss_kl)
+            info = {
+                "train/loss": loss_fm,
+                "train/loss_mse": loss_mse,
+                "train/loss_kl": loss_kl,
+            }
+            return loss, info            
         
-        loss, grads = nnx.value_and_grad(loss_fn)(training_state.model)
-        training_state.optimizer.update(training_state.model, grads)
+        (_, info), grads = nnx.value_and_grad(loss_fn, argnums=(0,1), has_aux=True)(
+            training_state.model, training_state.encoder
+        )
+        training_state.optimizer.update(training_state.model, grads[0])
+        training_state.encoder_optimizer.update(training_state.encoder, grads[1])
 
         ema_params = jax.tree_util.tree_map(
             lambda p, tp: p * (1 - cfg.ema_decay) + tp * cfg.ema_decay,
@@ -108,7 +142,14 @@ def make_flow_functions(cfg, data_shape):
         )
         nnx.update(training_state.ema_model, ema_params)
 
-        return loss
+        ema_encoder_params = jax.tree_util.tree_map(
+            lambda p, tp: p * (1 - cfg.ema_decay) + tp * cfg.ema_decay,
+            nnx.state(training_state.encoder),
+            nnx.state(training_state.ema_encoder),
+        )
+        nnx.update(training_state.ema_encoder, ema_encoder_params)
+
+        return info
 
     return sample, train_step
 
@@ -160,6 +201,10 @@ def run(cfg):
     graphdef, abstract_state = nnx.split(abstract_encoder)
     encoder_state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{cfg.encoder_ckpt}"), abstract_state)
     encoder = nnx.merge(graphdef, encoder_state)
+    ema_encoder = Encoder(
+        rngs=nnx.Rngs(cfg.seed),
+        from_pretrained=False,
+    )
     model = DiT2D_GHM(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
@@ -180,6 +225,7 @@ def run(cfg):
         action_dim=action_dim,
         rngs=nnx.Rngs(cfg.seed),
     )
+    nnx.update(ema_encoder, nnx.state(encoder))
     nnx.update(ema_model, nnx.state(model))
     optimizer = nnx.Optimizer(
         model,
@@ -191,11 +237,20 @@ def run(cfg):
         ),
         wrt=nnx.Param,
     )
-    training_state = TrainingState(model, ema_model, encoder, optimizer)
+    encoder_optimizer = nnx.Optimizer(
+        encoder,
+        optax.adam(
+            learning_rate=cfg.encoder_lr,   # TODO: parameterize
+            b1=cfg.beta_1,
+            b2=cfg.beta_2,
+        ),
+        wrt=nnx.Param,
+    )
+    training_state = TrainingState(model, ema_model, encoder, ema_encoder, optimizer, encoder_optimizer)
 
     # build sample, train fns
     sample_fn, train_step = make_flow_functions(cfg, obs_shape)
-    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.ema_model, training_state.encoder)
+    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.ema_model, training_state.ema_encoder)
     train_step_cached = nnx.cached_partial(train_step, training_state)
 
     # training
@@ -207,26 +262,22 @@ def run(cfg):
         batch = train_ds.sample(cfg.batch_size)
 
         key, key_update = jax.random.split(key)
-        loss_sum += train_step_cached(batch, key_update)
+        info = train_step_cached(batch, key_update)
+        loss_sum += info["train/loss_fm"]
 
         if step % cfg.log_every == 0:
             loss_avg = loss_sum / cfg.log_every
             training_time = time.time() - start
             print(f"step: {step} | loss: {loss_avg} | time: {training_time}")
-            wandb.log(
-                {
-                    "train/loss": loss_avg,
-                },
-                step=step,
-            )
+            wandb.log(info, step=step)  # TODO: average
             loss_sum = 0
-
+        
         if step % cfg.eval_every == 0 or step == 1:
             eval_batch = eval_ds.sample(cfg.eval_batch_size)
             x_gen_list = []
             for __ in range(cfg.eval_batch_size - 1):
                 key, key_sample = jax.random.split(key)
-                x_current, x_gen = sample_fn_chached(eval_batch, key_sample)
+                x_current, x_gen, info = sample_fn_chached(eval_batch, key_sample)
                 x_gen_list.append(x_gen)
 
             x_gens = jnp.concatenate(x_gen_list, axis=2)
@@ -244,7 +295,7 @@ def run(cfg):
             x_render = np.concatenate(rows, axis=0)
             plt.imshow(x_render)
             plt.savefig(os.path.join(output_dir, f"samples_{step}"))
-            wandb.log({"eval/samples": wandb.Image(x_render)}, step=step)
+            wandb.log({**info, "eval/samples": wandb.Image(x_render)}, step=step)
 
     #     if (step + 1) % config["SAVE_EVERY"] == 0:
     #         ema_algo = nnx.merge(graphdef, ema_params)
@@ -257,22 +308,25 @@ if __name__ == "__main__":
     # dataset
     parser.add_argument("--dataset_name", type=str, default="visual-scene-play-singletask-v0")
     # network architecture
-    parser.add_argument("--hidden_size", type=int, default=256)
+    parser.add_argument("--hidden_size", type=int, default=768)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--patch_size", type=int, default=2)
-    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--num_heads", type=int, default=12)
     # optimizer
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--encoder_lr", type=float, default=1e-5)
     parser.add_argument("--beta_1", type=float, default=0.9)
     parser.add_argument("--beta_2", type=float, default=0.999)
     parser.add_argument("--weight_decay", type=float, default=0.001)
     # training
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--target_denoise_steps", type=int, default=10)
     parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--num_updates", type=int, default=50000)
+    parser.add_argument("--encoder_weight", type=float, default=0.0)
+    parser.add_argument("--kl_weight", type=float, default=1e-5)
     parser.add_argument("--encoder_ckpt", type=str, default="25000")
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=5000)
