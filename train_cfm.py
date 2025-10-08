@@ -87,7 +87,7 @@ def run(cfg):
     short_dataset_name = cfg.dataset_name.replace("visual-","").replace("-singletask","").replace("-v0","")
     save_dir = os.path.join(cfg.save_dir, short_dataset_name, cfg.run_name)
     save_dir = os.path.abspath(os.path.expanduser(save_dir))
-    encoder_save_dir = save_dir = os.path.join(cfg.save_dir, short_dataset_name, "encoder")
+    encoder_save_dir = save_dir = os.path.join(cfg.save_dir, short_dataset_name, "encoderKL2")
     encoder_save_dir = os.path.abspath(os.path.expanduser(encoder_save_dir))
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:

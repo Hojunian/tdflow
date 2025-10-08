@@ -35,9 +35,13 @@ def make_flow_functions(cfg):
             logvar = dist.logvar
 
             loss_mse = jnp.mean((x_1 - y_1) ** 2)
+            loss_l1 = jnp.mean(jnp.abs(x_1 - y_1))
             loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
             
-            return loss_mse + cfg.kl_weight * loss_kl
+            if cfg.loss_type == 'l1':
+                return loss_l1 + cfg.kl_weight * loss_kl
+            else:
+                return loss_mse + cfg.kl_weight * loss_kl
             
         loss, grads = nnx.value_and_grad(loss_fn)(training_state.model)
         training_state.optimizer.update(training_state.model, grads)
@@ -51,10 +55,11 @@ def make_flow_functions(cfg):
         logvar = dist.logvar
         
         loss_mse = jnp.mean((x_1 - y_1) ** 2)
+        loss_l1 = jnp.mean(jnp.abs(x_1 - y_1))
         loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
 
 
-        return loss_mse, loss_kl, model.decode(model(x_1))
+        return loss_mse, loss_l1, loss_kl, model.decode(model(x_1))
 
     return train_step, val_step
 
@@ -136,7 +141,7 @@ def run(cfg):
             x_val = batch["observations"].astype(jnp.float32) / 255.0
             
             key, key_val = jax.random.split(key)
-            loss_mse, loss_kl, y_val = val_step_cached(x_val, key_val)
+            loss_mse, loss_l1, loss_kl, y_val = val_step_cached(x_val, key_val)
 
             x_np = np.array(x_val)
             y_np = np.array(y_val)
@@ -151,6 +156,7 @@ def run(cfg):
             plt.savefig(os.path.join(output_dir, f"samples_{step}"))
             wandb.log({
                     "eval/loss_mse": loss_mse,
+                    "eval/loss_l1": loss_l1,
                     "eval/loss_kl": loss_kl,
                     "eval/samples": wandb.Image(x_render),
                 }, 
@@ -177,12 +183,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta_1", type=float, default=0.9)
     parser.add_argument("--beta_2", type=float, default=0.999)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
     # training
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_updates", type=int, default=25000)
-    parser.add_argument("--kl_weight", type=float, default=1e-6)
+    parser.add_argument("--kl_weight", type=float, default=1e-5)
+    parser.add_argument("--loss_type", type=str, default="l2")
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=1000)
     parser.add_argument("--eval_batch_size", type=int, default=4)
@@ -191,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_dir", type=str, default="results/"
     )
-    parser.add_argument("--run_name", type=str, default="encoder")
+    parser.add_argument("--run_name", type=str, default="encoderKL2")
 
     args, rest_args = parser.parse_known_args(sys.argv[1:])
 
