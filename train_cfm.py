@@ -14,7 +14,8 @@ from flax import nnx
 import orbax.checkpoint as ocp
 import numpy as np
 
-from model.encoder import Encoder, EncodedDiT2D
+from model.encoder import Encoder
+from model.network import DiT2D
 
 from utils.config import str2bool
 from utils.ogbench import make_datasets
@@ -35,10 +36,11 @@ def make_flow_functions(cfg, data_shape):
         def sample_step(carry):
             x_t, t = carry
 
-            x_t_mid = x_t + model(x_t, t) * (eval_dt / 2)
-            t_mid = t + (eval_dt / 2)
+            v_t = model(x_t, t)
+            x_tilde = x_t + v_t * eval_dt
+            v_tilde = model(x_tilde, t + eval_dt)
 
-            x_t += model(x_t_mid, t_mid) * eval_dt
+            x_t += (v_t + v_tilde) * (eval_dt / 2)
             t += eval_dt
             return (x_t, t)
         
@@ -93,6 +95,9 @@ def run(cfg):
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
         yaml.dump(cfg, outfile)
 
+    if not cfg.use_wandb:
+        os.environ["WANDB_MODE"] = "disabled"
+
     wandb.init(
         project="tdflow",
         name=cfg.run_name,
@@ -123,24 +128,22 @@ def run(cfg):
     graphdef, abstract_state = nnx.split(abstract_encoder)
     encoder_state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{cfg.encoder_ckpt}"), abstract_state)
     encoder = nnx.merge(graphdef, encoder_state)
-    model = EncodedDiT2D(
+    model = DiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
         num_heads=cfg.num_heads,
         img_size=obs_shape[:-1],
         in_channels=obs_shape[-1],
-        action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
-    ema_model = EncodedDiT2D(
+    ema_model = DiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
         num_heads=cfg.num_heads,
         img_size=obs_shape[:-1],
         in_channels=obs_shape[-1],
-        action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
     nnx.update(ema_model, nnx.state(model))
@@ -158,7 +161,7 @@ def run(cfg):
 
     # build sample, train fns
     sample_fn, train_step = make_flow_functions(cfg, obs_shape)
-    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.model, training_state.encoder)
+    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.ema_model, training_state.encoder)
     train_step_cached = nnx.cached_partial(train_step, training_state)
 
     # setup train, sample function
@@ -228,11 +231,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta_1", type=float, default=0.9)
     parser.add_argument("--beta_2", type=float, default=0.999)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=0.001)
     # training
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--ema_decay", type=float, default=0.99)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--num_updates", type=int, default=100000)
     parser.add_argument("--encoder_ckpt", type=str, default="25000")
     # eval and logging
@@ -244,6 +247,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_dir", type=str, default="results/"
     )
+    parser.add_argument("--use_wandb", type=str2bool, default=False)
     parser.add_argument("--run_name", type=str, default="demo")
 
     args, rest_args = parser.parse_known_args(sys.argv[1:])
