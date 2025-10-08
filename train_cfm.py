@@ -24,12 +24,13 @@ import time
 class TrainingState:
     model: nnx.Module
     ema_model: nnx.Module
+    encoder: nnx.Module
     optimizer: nnx.Optimizer
 
 def make_flow_functions(cfg, data_shape):
     eval_dt = 1 / cfg.eval_denoise_steps
     @nnx.jit
-    def sample(model: nnx.Module, key: jnp.ndarray):
+    def sample(model: nnx.Module, encoder: nnx.Module, key: jnp.ndarray):
         @nnx.scan(length=cfg.eval_denoise_steps, in_axes=(nnx.Carry), out_axes=(nnx.Carry))
         def sample_step(carry):
             x_t, t = carry
@@ -45,12 +46,12 @@ def make_flow_functions(cfg, data_shape):
         t = jnp.zeros((cfg.eval_batch_size,), dtype=jnp.float32)
 
         x_1 = sample_step((x_t,t))[0]
-        return model.encoder.decode(x_1)
+        return encoder.decode(x_1)
 
     @nnx.jit
     def train_step(training_state: TrainingState, x: jnp.ndarray, key: jnp.ndarray):
         key, key_encoder = jax.random.split(key)
-        x = training_state.model.encoder(x, key_encoder)
+        x = training_state.encoder(x, key_encoder)
         
         key, key_time = jax.random.split(key)
         t = jax.random.uniform(key_time, shape=((x.shape[0]),))
@@ -119,8 +120,9 @@ def run(cfg):
             from_pretrained=False,
         )
     )
-    _, abstract_state = nnx.split(abstract_encoder)
+    graphdef, abstract_state = nnx.split(abstract_encoder)
     encoder_state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{cfg.encoder_ckpt}"), abstract_state)
+    encoder = nnx.merge(graphdef, encoder_state)
     model = EncodedDiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
@@ -141,7 +143,6 @@ def run(cfg):
         action_dim=1,
         rngs=nnx.Rngs(cfg.seed),
     )
-    nnx.update(model.encoder, encoder_state)
     nnx.update(ema_model, nnx.state(model))
     optimizer = nnx.Optimizer(
         model,
@@ -153,11 +154,11 @@ def run(cfg):
         ),
         wrt=nnx.Param,
     )
-    training_state = TrainingState(model, ema_model, optimizer)
+    training_state = TrainingState(model, ema_model, encoder, optimizer)
 
     # build sample, train fns
     sample_fn, train_step = make_flow_functions(cfg, obs_shape)
-    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.model)
+    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.model, training_state.encoder)
     train_step_cached = nnx.cached_partial(train_step, training_state)
 
     # setup train, sample function
