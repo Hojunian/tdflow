@@ -62,6 +62,7 @@ def make_flow_functions(cfg, data_shape):
         x_next_raw = batch["next_observations"].astype(jnp.float32) / 255.0
         x_next = training_state.encoder(x_next_raw, key_next)
         a_next = batch["next_actions"]
+        mask = batch["masks"][:, None, None, None]
 
         key, key_time = jax.random.split(key)
         t_cfm = jax.random.uniform(key_time, shape=((x_current.shape[0]),))
@@ -91,7 +92,9 @@ def make_flow_functions(cfg, data_shape):
 
         def loss_fn(model: nnx.Module):
             next_state_loss = jnp.mean((v_t_cfm - model(x_t_cfm, x_current, a_current, t_cfm)) ** 2) 
-            bootstrap_loss = jnp.mean((v_t_bootstrap - model(x_t_bootstrap, x_current, a_current, t_bootstrap)) ** 2)
+            bootstrap_loss = jnp.mean(
+                mask * (v_t_bootstrap - model(x_t_bootstrap, x_current, a_current, t_bootstrap)) ** 2
+            )
 
             return (1 - cfg.gamma) * next_state_loss + cfg.gamma * bootstrap_loss
         
