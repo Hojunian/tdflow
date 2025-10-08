@@ -184,7 +184,6 @@ class DiT2D(nnx.Module):
         num_heads: int,
         img_size: tuple,
         in_channels: int,
-        action_dim: int,
         rngs: nnx.Rngs,
         dtype: Dtype = jnp.bfloat16,
     ):
@@ -262,7 +261,7 @@ class DiT2D_GHM(nnx.Module):
         self.num_patches_w = img_size[1] // patch_size
         self.dtype = dtype
 
-        self.x_embedder = PatchEmbed(patch_size, in_channels, hidden_size, dtype, rngs)
+        self.x_embedder = PatchEmbed(patch_size, 2 * in_channels, hidden_size, dtype, rngs)
         self.t_embedder = TimestepEmbedder(hidden_size, dtype, rngs)
         self.a_embedder = nnx.Linear(action_dim, hidden_size, rngs=rngs)
 
@@ -271,14 +270,15 @@ class DiT2D_GHM(nnx.Module):
         ]
         self.final_layer = FinalLayer(patch_size, in_channels, hidden_size, dtype, rngs)
 
-    def __call__(self, x, t, a=None):
+    def __call__(self, x, x_prev, a, t):
+        x = jnp.concatenate([x, x_prev], axis=-1)
         x = self.x_embedder(x)
         x += get_2d_sincos_pos_embed(
             None, self.hidden_size, self.img_size, self.patch_size
         ).astype(self.dtype)
+        
         c = self.t_embedder(t)
-        if a is not None:
-            c += self.a_embedder(a)
+        c += self.a_embedder(a)
 
         for block in self.blocks:
             x = block(x, c)
