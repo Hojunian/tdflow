@@ -14,6 +14,7 @@ from flax import nnx
 import orbax.checkpoint as ocp
 import numpy as np
 
+from model.encoder import Encoder
 from model.network import DiT2D_GHM
 
 from utils.config import str2bool
@@ -24,13 +25,15 @@ import time
 class TrainingState:
     model: nnx.Module
     ema_model: nnx.Module
+    encoder: nnx.Module
     optimizer: nnx.Optimizer
 
 def make_flow_functions(cfg, data_shape):
     eval_dt = 1 / cfg.eval_denoise_steps
     @nnx.jit
-    def sample(model: nnx.Module, batch: dict, key: jnp.ndarray):
-        x_current = batch["observations"].astype(jnp.float32) / 255.0
+    def sample(model: nnx.Module, encoder: nnx.Module, batch: dict, key: jnp.ndarray):
+        x_current_raw = batch["observations"].astype(jnp.float32) / 255.0
+        x_current = encoder(x_current_raw)
         a_current = batch["actions"]
         @nnx.scan(length=cfg.eval_denoise_steps, in_axes=(nnx.Carry), out_axes=(nnx.Carry))
         def sample_step(carry):
@@ -46,13 +49,18 @@ def make_flow_functions(cfg, data_shape):
         x_t = jax.random.normal(key, shape=(cfg.eval_batch_size,) + data_shape)
         t = jnp.zeros((cfg.eval_batch_size,), dtype=jnp.float32)
 
-        return x_current, sample_step((x_t,t))[0]
+        x_1 = sample_step((x_t,t))[0]
+        return x_current_raw, encoder.decode(x_1)
 
     @nnx.jit
     def train_step(training_state: TrainingState, batch: dict, key: jnp.ndarray):
-        x_current = batch["observations"].astype(jnp.float32) / 255.0
+        key, key_current = jax.random.split(key)
+        x_current_raw = batch["observations"].astype(jnp.float32) / 255.0
+        x_current = training_state.encoder(x_current_raw, key_current)
         a_current = batch["actions"]
-        x_next = batch["next_observations"].astype(jnp.float32) / 255.0
+        key, key_next = jax.random.split(key)
+        x_next_raw = batch["next_observations"].astype(jnp.float32) / 255.0
+        x_next = training_state.encoder(x_next_raw, key_next)
         a_next = batch["next_actions"]
 
         key, key_time = jax.random.split(key)
@@ -106,15 +114,14 @@ def run(cfg):
     np.random.seed(cfg.seed)
     # make save dir
     os.makedirs(cfg.save_dir, exist_ok=True)
-    save_dir = os.path.join(cfg.save_dir, cfg.run_name)
+    short_dataset_name = cfg.dataset_name.replace("visual-","").replace("-singletask","").replace("-v0","")
+    save_dir = os.path.join(cfg.save_dir, short_dataset_name, cfg.run_name)
+    save_dir = os.path.abspath(os.path.expanduser(save_dir))
+    encoder_save_dir = save_dir = os.path.join(cfg.save_dir, short_dataset_name, "encoderKL2")
+    encoder_save_dir = os.path.abspath(os.path.expanduser(encoder_save_dir))
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "cfg.yaml"), "w") as outfile:
         yaml.dump(cfg, outfile)
-
-    output_dir = os.path.join(save_dir, "outputs")
-    ckpt_dir = os.path.join(save_dir, "ckpts")
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
 
     if not cfg.use_wandb:
         os.environ["WANDB_MODE"] = "disabled"
@@ -126,12 +133,30 @@ def run(cfg):
         save_code=True,
     )
 
+    output_dir = os.path.join(save_dir, "outputs")
+    ckpt_dir = os.path.join(save_dir, "ckpts")
+    encoder_ckpt_dir = os.path.join(encoder_save_dir, "ckpts")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     # build dataset
     train_ds, eval_ds = make_datasets(cfg.dataset_name)
     obs_shape = train_ds["observations"][0].shape
+    ## latent
+    obs_shape = tuple(x//8 for x in obs_shape[:-1]) + (4,)
     action_dim = train_ds["actions"][0].shape[0]
 
     # build training state
+    checkpointer = ocp.StandardCheckpointer()
+    abstract_encoder = nnx.eval_shape(
+        lambda: Encoder(
+            rngs=nnx.Rngs(cfg.seed),
+            from_pretrained=False,
+        )
+    )
+    graphdef, abstract_state = nnx.split(abstract_encoder)
+    encoder_state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{cfg.encoder_ckpt}"), abstract_state)
+    encoder = nnx.merge(graphdef, encoder_state)
     model = DiT2D_GHM(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
@@ -163,11 +188,11 @@ def run(cfg):
         ),
         wrt=nnx.Param,
     )
-    training_state = TrainingState(model, ema_model, optimizer)
+    training_state = TrainingState(model, ema_model, encoder, optimizer)
 
     # build sample, train fns
     sample_fn, train_step = make_flow_functions(cfg, obs_shape)
-    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.ema_model)
+    sample_fn_chached = nnx.cached_partial(sample_fn, training_state.ema_model, training_state.encoder)
     train_step_cached = nnx.cached_partial(train_step, training_state)
 
     # training
@@ -227,7 +252,7 @@ def run(cfg):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # dataset
-    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-v0")
+    parser.add_argument("--dataset_name", type=str, default="visual-scene-play-singletask-v0")
     # network architecture
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
@@ -245,6 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_denoise_steps", type=int, default=10)
     parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--num_updates", type=int, default=50000)
+    parser.add_argument("--encoder_ckpt", type=str, default="25000")
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=5000)
     parser.add_argument("--eval_batch_size", type=int, default=4)

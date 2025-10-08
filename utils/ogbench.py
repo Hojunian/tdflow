@@ -63,6 +63,10 @@ class Dataset(FrozenDict):
         if 'next_observations' not in result:
             result['next_observations'] = self._dict['observations'][np.minimum(idxs + 1, self.size - 1)]
             result['next_actions'] = self._dict['actions'][np.minimum(idxs + 1, self.size - 1)]
+        if 'next_actions' not in result:
+            # WARNING: This is incorrect at the end of the trajectory. Use with caution.
+            result['next_actions'] = self['actions'][np.minimum(idxs + 1, self.size - 1)]
+            assert np.allclose(result['next_actions'], self._dict['actions'][np.minimum(idxs + 1, self.size - 1)])
         return result
 
 
@@ -221,12 +225,6 @@ def make_datasets(
     import ogbench
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name)
     env.close()
-
-    for k in ['qpos', 'qvel', 'button_states']:
-        if k in train_dataset:
-            del train_dataset[k]
-        if k in val_dataset:
-            del val_dataset[k]
 
     train_dataset = Dataset.create(**train_dataset)
     val_dataset = Dataset.create(**val_dataset)

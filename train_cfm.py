@@ -14,7 +14,8 @@ from flax import nnx
 import orbax.checkpoint as ocp
 import numpy as np
 
-from model.encoder import Encoder, EncodedDiT2D
+from model.encoder import Encoder
+from model.network import DiT2D
 
 from utils.config import str2bool
 from utils.ogbench import make_datasets
@@ -127,7 +128,7 @@ def run(cfg):
     graphdef, abstract_state = nnx.split(abstract_encoder)
     encoder_state = checkpointer.restore(os.path.join(encoder_ckpt_dir, f"encoder_{cfg.encoder_ckpt}"), abstract_state)
     encoder = nnx.merge(graphdef, encoder_state)
-    model = EncodedDiT2D(
+    model = DiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
@@ -136,7 +137,7 @@ def run(cfg):
         in_channels=obs_shape[-1],
         rngs=nnx.Rngs(cfg.seed),
     )
-    ema_model = EncodedDiT2D(
+    ema_model = DiT2D(
         patch_size=cfg.patch_size,
         hidden_size=cfg.hidden_size,
         depth=cfg.depth,
