@@ -186,36 +186,41 @@ def make_datasets(
         add_info: Whether to add observation information ('qpos', 'qvel', and 'button_states') to the datasets.
         **env_kwargs: Keyword arguments to pass to the environment.
     """
-    # Make environment.
-    splits = dataset_name.split('-')
-    dataset_add_info = add_info
+    # # Make environment.
+    # splits = dataset_name.split('-')
+    # dataset_add_info = add_info
    
-    # Load datasets.
-    if dataset_path is None:
-        dataset_dir = os.path.expanduser(dataset_dir)
-        download_datasets([dataset_name], dataset_dir)
-        train_dataset_path = os.path.join(dataset_dir, f'{dataset_name}.npz')
-        val_dataset_path = os.path.join(dataset_dir, f'{dataset_name}-val.npz')
-    else:
-        train_dataset_path = dataset_path
-        val_dataset_path = dataset_path.replace('.npz', '-val.npz')
+    # # Load datasets.
+    # if dataset_path is None:
+    #     dataset_dir = os.path.expanduser(dataset_dir)
+    #     download_datasets([dataset_name], dataset_dir)
+    #     train_dataset_path = os.path.join(dataset_dir, f'{dataset_name}.npz')
+    #     val_dataset_path = os.path.join(dataset_dir, f'{dataset_name}-val.npz')
+    # else:
+    #     train_dataset_path = dataset_path
+    #     val_dataset_path = dataset_path.replace('.npz', '-val.npz')
 
-    ob_dtype = np.uint8
-    action_dtype = np.float32
-    train_dataset = load_dataset(
-        train_dataset_path,
-        ob_dtype=ob_dtype,
-        action_dtype=action_dtype,
-        compact_dataset=compact_dataset,
-        add_info=dataset_add_info,
-    )
-    val_dataset = load_dataset(
-        val_dataset_path,
-        ob_dtype=ob_dtype,
-        action_dtype=action_dtype,
-        compact_dataset=compact_dataset,
-        add_info=dataset_add_info,
-    )
+    # ob_dtype = np.uint8
+    # action_dtype = np.float32
+    # train_dataset = load_dataset(
+    #     train_dataset_path,
+    #     ob_dtype=ob_dtype,
+    #     action_dtype=action_dtype,
+    #     compact_dataset=compact_dataset,
+    #     add_info=dataset_add_info,
+    # )
+    # val_dataset = load_dataset(
+    #     val_dataset_path,
+    #     ob_dtype=ob_dtype,
+    #     action_dtype=action_dtype,
+    #     compact_dataset=compact_dataset,
+    #     add_info=dataset_add_info,
+    # )
+
+    os.environ["MUJOCO_GL"] = "egl"
+    import ogbench
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name)
+    env.close()
 
     for k in ['qpos', 'qvel', 'button_states']:
         if k in train_dataset:
