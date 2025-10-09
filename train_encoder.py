@@ -29,10 +29,10 @@ def make_flow_functions(cfg):
     @nnx.jit
     def train_step(training_state, x_1, key):
         def loss_fn(model: nnx.Module):
-            mu, logvar = model.encode(x_1)
-            noise = jax.random.normal(key, shape=mu.shape)
-            z = mu + jnp.exp(0.5 * logvar) * noise
+            z, dist = model.encode(x_1, key)
             y_1 = model.decode(z)
+            mu = dist.mean
+            logvar = dist.logvar
 
             loss_mse = jnp.mean((x_1 - y_1) ** 2)
             loss_l1 = jnp.mean(jnp.abs(x_1 - y_1))
@@ -49,17 +49,17 @@ def make_flow_functions(cfg):
 
     @nnx.jit
     def val_step(model, x_1, key):
-        mu, logvar = model.encode(x_1)
-        noise = jax.random.normal(key, shape=mu.shape)
-        z = mu + jnp.exp(0.5 * logvar) * noise
+        z, dist = model.encode(x_1, key)
         y_1 = model.decode(z)
+        mu = dist.mean
+        logvar = dist.logvar
         
         loss_mse = jnp.mean((x_1 - y_1) ** 2)
         loss_l1 = jnp.mean(jnp.abs(x_1 - y_1))
         loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
 
 
-        return loss_mse, loss_l1, loss_kl, model.decode(mu)
+        return loss_mse, loss_l1, loss_kl, model.decode(model(x_1))
 
     return train_step, val_step
 
@@ -89,14 +89,11 @@ def run(cfg):
 
     # build dataset
     train_ds, val_ds = make_datasets(cfg.dataset_name)
-    obs_shape = train_ds["observations"][0].shape
 
     # build training state
     checkpointer = ocp.StandardCheckpointer()
     encoder = Encoder(
         rngs=nnx.Rngs(cfg.seed),
-        img_size=obs_shape[:-1],
-        in_features=obs_shape[-1],
     )
     optimizer = nnx.Optimizer(
         encoder,
@@ -201,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_dir", type=str, default="results/"
     )
-    parser.add_argument("--run_name", type=str, default="encoderKL2_impala")
+    parser.add_argument("--run_name", type=str, default="encoderKL2")
 
     args, rest_args = parser.parse_known_args(sys.argv[1:])
 
