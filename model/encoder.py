@@ -1,6 +1,7 @@
 from typing import Sequence
 
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 
 from model.common import MLP
@@ -57,11 +58,11 @@ class ResnetStack(nnx.Module):
             for _ in range(num_blocks)
         ]
         if deconv:
-            self.deconv = nnx.ConvTranspose(
+            self.deconv = nnx.Conv(
                 out_features,
                 out_features,
-                kernel_size=(2, 2),
-                strides=2,
+                kernel_size=(3, 3),
+                strides=1,
                 padding='SAME',
                 kernel_init=initializer,
                 rngs=rngs,
@@ -81,6 +82,11 @@ class ResnetStack(nnx.Module):
             )
         
         if self.deconv:
+            conv_out = jax.image.resize(
+                conv_out, 
+                (conv_out.shape[0], conv_out.shape[1]*2, conv_out.shape[2]*2, conv_out.shape[3]),
+                method = 'linear'
+            )
             conv_out = self.deconv(conv_out)
 
         for i in range(self.num_blocks):
@@ -235,7 +241,7 @@ class Encoder(nnx.Module):
         stack_sizes: tuple = (64, 128, 128),  # (16, 32, 32)
         num_blocks: int = 2,    # 1
         dropout_rate: float | None = None,
-        mlp_hidden_dims: Sequence[int] = (1024,),    # (512,)
+        mlp_hidden_dims: Sequence[int] = (1024, 1024),    # (512,)
         layer_norm: bool = False,
     ):
         self.encoder = ImpalaEncoder(

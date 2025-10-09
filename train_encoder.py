@@ -18,6 +18,7 @@ from model.encoder import Encoder
 
 from utils.config import str2bool
 from utils.ogbench import make_datasets
+from utils.lpips import lpips_loss
 import time
 
 @flax.struct.dataclass
@@ -36,12 +37,10 @@ def make_flow_functions(cfg):
 
             loss_mse = jnp.mean((x_1 - y_1) ** 2)
             loss_l1 = jnp.mean(jnp.abs(x_1 - y_1))
+            loss_lpips = lpips_loss(x_1, y_1)
             loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
             
-            if cfg.loss_type == 'l1':
-                return loss_l1 + cfg.kl_weight * loss_kl
-            else:
-                return loss_mse + cfg.kl_weight * loss_kl
+            return loss_mse + cfg.l1_weight * loss_l1 + cfg.lpips_weight * loss_lpips + cfg.kl_weight * loss_kl
             
         loss, grads = nnx.value_and_grad(loss_fn)(training_state.model)
         training_state.optimizer.update(training_state.model, grads)
@@ -56,10 +55,10 @@ def make_flow_functions(cfg):
         
         loss_mse = jnp.mean((x_1 - y_1) ** 2)
         loss_l1 = jnp.mean(jnp.abs(x_1 - y_1))
+        loss_lpips = lpips_loss(x_1, y_1)
         loss_kl = 0.5 * jnp.mean(mu ** 2 + jnp.exp(logvar) - logvar - 1)
 
-
-        return loss_mse, loss_l1, loss_kl, model.decode(mu)
+        return loss_mse, loss_l1, loss_lpips, loss_kl, model.decode(mu)
 
     return train_step, val_step
 
@@ -144,7 +143,7 @@ def run(cfg):
             x_val = batch["observations"].astype(jnp.float32) / 255.0
             
             key, key_val = jax.random.split(key)
-            loss_mse, loss_l1, loss_kl, y_val = val_step_cached(x_val, key_val)
+            loss_mse, loss_l1, loss_lpips, loss_kl, y_val = val_step_cached(x_val, key_val)
 
             x_np = np.array(x_val)
             y_np = np.array(y_val)
@@ -160,6 +159,7 @@ def run(cfg):
             wandb.log({
                     "eval/loss_mse": loss_mse,
                     "eval/loss_l1": loss_l1,
+                    "eval/loss_lpips": loss_lpips,
                     "eval/loss_kl": loss_kl,
                     "eval/samples": wandb.Image(x_render),
                 }, 
@@ -190,18 +190,19 @@ if __name__ == "__main__":
     # training
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_updates", type=int, default=25000)
+    parser.add_argument("--num_updates", type=int, default=250000)
+    parser.add_argument("--l1_weight", type=float, default=0.0)
+    parser.add_argument("--lpips_weight", type=float, default=0.03)
     parser.add_argument("--kl_weight", type=float, default=1e-5)
-    parser.add_argument("--loss_type", type=str, default="l2")
     # eval and logging
     parser.add_argument("--eval_every", type=int, default=1000)
     parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--save_every", type=int, default=5000)
+    parser.add_argument("--save_every", type=int, default=50000)
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument(
         "--save_dir", type=str, default="results/"
     )
-    parser.add_argument("--run_name", type=str, default="encoderKL2_impala")
+    parser.add_argument("--run_name", type=str, default="encoderKL2_upsample")
 
     args, rest_args = parser.parse_known_args(sys.argv[1:])
 
